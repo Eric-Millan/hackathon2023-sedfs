@@ -1,0 +1,162 @@
+"""
+Author: Eric Millan 
+Updated: April 26th, 2023
+Description: Hackathon for Geopandas
+"""
+
+# %%  imports and File Configuration 
+import sys
+import arcpy, arcpy.management, arcpy.conversion, arcpy.analysis
+import geopandas as gpd
+import pandas as pd
+import matplotlib 
+import arcpy
+import seaborn
+import numpy
+
+sys.path.append(r'\\spatialfiles.bcgov\work\srm\sry\Local\scripts\python')
+from sc_python_function_library import * 
+
+# credentials
+oracle_username, oracle_password, agol_username, agol_password = get_credentials(
+  "oracle", "agol")
+
+# configuration
+json_directory = r'W:\srm\sry\Workarea\emillan\sandbox\geopandas_hackathon\json_directory'
+arcpy.env.workspace = r'W:\srm\sry\Workarea\emillan\sandbox\geopandas_hackathon\Geopandas_Workspace\Geopandas_Workspace.gdb'
+arcpy.env.overwriteOutput = True
+arcpy.env.parallelProcessingFactor = "100%"
+
+bcgw_connection = r'W:\srm\sry\Workarea\emillan\sandbox\geopandas_hackathon\Geopandas_Workspace\Geopandas_BCGW_Connection.sde'
+create_bcgw_connection(bcgw_connection, oracle_username, oracle_password)
+
+fire_bcgw_data = f'{bcgw_connection}\\WHSE_LAND_AND_NATURAL_RESOURCE.PROT_HISTORICAL_FIRE_POLYS_SP'
+wha_bcgw_data = f'{bcgw_connection}\\WHSE_WILDLIFE_MANAGEMENT.WCP_WILDLIFE_HABITAT_AREA_POLY'
+vri_bcgw_data = f'{bcgw_connection}\\WHSE_FOREST_VEGETATION.VEG_COMP_LYR_R1_POLY'
+lsu_bcgw_data = f'{bcgw_connection}\\WHSE_LAND_USE_PLANNING.RMP_LANDSCAPE_UNIT_SVW'
+
+# THIS WHERE CLAUSE SELECTS THE AREA OF INTEREST, AND IT SET TO ONLY TEST USING TWO LANDSCAPE UNITS
+
+# %% THIS CELL IS WHERE WE CREATE THE AOI. SPECIFY THE 
+def get_aoi_features(aoi_layer, aoi_query_field, aoi_attributes):
+  where_clause = f"{aoi_query_field} IN {tuple(aoi_attributes)}"
+  print(where_clause)
+  selection = arcpy.management.SelectLayerByAttribute(aoi_layer, "ADD_TO_SELECTION", where_clause)
+  arcpy.management.CopyFeatures(selection, "aoi")
+
+aoi_layer = lsu_bcgw_data
+aoi_query_field = "LANDSCAPE_UNIT_NAME"
+aoi_attributes = ['Imperial - Monkman', 'Wolverine']
+get_aoi_features(aoi_layer, aoi_query_field, aoi_attributes)
+
+# %% Create Clipped Dataset and Prepare for geojsonExport
+layer_dict = {fire_bcgw_data:["fire_clip",f"{json_directory}\\fire.geojson"], 
+              wha_bcgw_data:["wha_clip",f"{json_directory}\\wha.geojson"], 
+              vri_bcgw_data:["vri_clip",f"{json_directory}\\vri.geojson"]
+              }
+
+for key, value in layer_dict.items():
+  arcpy.analysis.Clip(key, "aoi", value[0])
+  arcpy.conversion.FeaturesToJSON(value[0], value[1], geoJSON='GEOJSON')
+arcpy.conversion.FeaturesToJSON('aoi', f"{json_directory}\\aoi.geojson", geoJSON='GEOJSON')
+
+# %% Create Geopandas Dataframe from VRI JSON fle
+def create_geopandas_gdf(input_geojson, keep_fields):
+  gdf = gpd.read_file(input_geojson)
+  fields_to_drop = [col for col in gdf.columns if col not in fields_to_keep]
+  gdf = gdf.drop(fields_to_drop, axis=1)
+  return gdf
+  # gdf.set_crs(epsg=4326)
+
+fields_to_keep = ["geometry","SPECIES_CD_1", "SPECIES_PCT_1", "SPECIES_CD_2", "SPECIES_PCT_2", "SPECIES_CD_3", "SPECIES_PCT_3", "SPECIES_CD_4", "SPECIES_PCT_4", "SPECIES_CD_5", "SPECIES_PCT_5", "PROJ_AGE_1", "PROJ_AGE_CLASS_CD_1"]
+vri_gdf = create_geopandas_gdf(layer_dict[vri_bcgw_data][1], fields_to_keep)
+
+fields_to_keep = ["geometry", "FIRE_YEAR", "FIRE_CAUSE"]
+fire_gdf = create_geopandas_gdf(layer_dict[fire_bcgw_data][1], fields_to_keep)
+
+fields_to_keep = ["geometry", "TAG", "COMMON_SPECIES_NAME", "TIMBER_HARVEST_CODE"]
+wha_gdf = create_geopandas_gdf(layer_dict[wha_bcgw_data][1], fields_to_keep)
+
+fields_to_keep = ["geometry", "LANDSCAPE_UNIT_NAME"]
+aoi_gdf = create_geopandas_gdf(f"{json_directory}\\aoi.geojson", fields_to_keep)
+
+# %% CREATE WHA AREA SUMMARY FIELDS FROM OVERLAY with VRI DATA (IE, Gets the Denominator Fields)
+vri_wha_geodataframe = gpd.overlay(wha_gdf, vri_gdf, how='intersection')
+vri_wha_geodataframe['hectares'] = (vri_wha_geodataframe.geometry.area/10000)
+
+# %% GET THE Amount of Timber for Each WHA
+for WMA_TAG in vri_wha_geodataframe["TAG"].unique():
+  wma_selection_gdf = vri_wha_geodataframe[vri_wha_geodataframe['TAG'] == WMA_TAG]
+  wma_species_list = wma_selection_gdf[["SPECIES_CD_1","SPECIES_CD_2","SPECIES_CD_3","SPECIES_CD_4","SPECIES_CD_5"]].values.flatten()
+  unique_species = set(wma_species_list)
+
+  species_percent_dict = {"SPECIES_CD_1":"SPECIES_PCT_1", "SPECIES_CD_2":"SPECIES_PCT_2", "SPECIES_CD_3":"SPECIES_PCT_3", "SPECIES_CD_4":"SPECIES_PCT_4","SPECIES_CD_5":"SPECIES_PCT_5"}
+
+  # Iterate Through Species
+
+  sum_dict = {}
+  for species in unique_species:
+    species_area = 0
+    # Interate through species rank and percentage dict
+    for key, value in species_percent_dict.items():
+      # Iterate through rows in WMA Seclation 
+      for index, row in wma_selection_gdf.iterrows():
+        if row[key] == species:
+          species_area += (row[value]/100)*row['hectares']
+    sum_dict[species] = species_area
+  del sum_dict[None]
+  sorted_dict = dict(sorted(sum_dict.items(), key=lambda x: x[1], reverse=True))
+
+  labels = list(sorted_dict.keys())
+  values = list(sorted_dict.values())
+
+  seaborn.set_style("whitegrid")
+  seaborn.set_palette("pastel")
+
+  # matplotlib.pyplot.figure(6,6)
+  matplotlib.pyplot.pie(values, labels=labels, autopct="%1.1f%%")
+  matplotlib.pyplot.title(f"WMA {WMA_TAG} Tree Species Distribution")
+  matplotlib.pyplot.show()
+
+
+
+# %%
+# Make Megaframe
+intersection = gpd.overlay(vri_gdf, fire_gdf, how='intersection')
+intersection2 = gpd.overlay(intersection, wha_gdf, how='intersection')
+# %%
+vri_gdf.plot()
+fire_gdf.plot()
+wha_gdf.plot()
+vri_wha_geodataframe.plot()
+
+# %%
+intersection2.plot(column='SPECIES_PCT_1')
+intersection2.plot(column='TAG')
+intersection2.plot(column='FIRE_YEAR')
+intersection2.plot(column='PROJ_AGE_1')
+# %%
+grouped = intersection2.groupby(['PROJ_AGE_1','SPECIES_CD_1'])['geometry'].apply(lambda x: x.area.sum()).reset_index()
+
+# Pivot the grouped data so that each leading species is a column and the burned area is the value
+pivoted = grouped.pivot(index='PROJ_AGE_1', columns='SPECIES_CD_1', values='geometry')
+
+# Plot the pivoted data as a stacked bar chart
+pivoted.plot(kind='bar', stacked=True)
+
+# Set the title and axis labels
+matplotlib.pyplot.title('Burned Area by Leading Species')
+matplotlib.pyplot.xlabel('Year')
+matplotlib.pyplot.ylabel('Burned Area (square meters)')
+
+# Show the plot
+matplotlib.pyplot.show()
+# %%
+
+# %% Calculate Area
+vri_gdf['area'] = vri_gdf.geometry.area
+
+# Print the updated dataframe
+print(vri_gdf.head())
+
+# %%
